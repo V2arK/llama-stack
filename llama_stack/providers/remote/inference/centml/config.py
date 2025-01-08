@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, SecretStr
 
 
 @json_schema_type
-class CentmlImplConfig(BaseModel):
+class CentMLImplConfig(BaseModel):
     url: str = Field(
         default="https://api.centml.com/openai/v1",
         description="The CentML API server URL",
