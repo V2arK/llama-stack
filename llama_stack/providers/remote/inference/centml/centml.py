@@ -61,8 +61,8 @@ from .config import CentMLImplConfig
 #
 MODEL_ALIASES = [
     build_model_alias(
-        "meta-llama/Llama-3.3-70B-Instruct",
-        CoreModelId.llama3_3_70b_instruct.value,
+        "meta-llama/Llama-3.2-3B-Instruct-Turbo",
+        CoreModelId.llama3_2_3b_instruct.value,
     ),
     # Add any additional aliases as needed
 ]
