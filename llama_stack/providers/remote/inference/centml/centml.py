@@ -63,14 +63,15 @@ MODEL_ALIASES = [
 
 
 class CentMLInferenceAdapter(ModelRegistryHelper, Inference,
-                            NeedsRequestProviderData):
+                             NeedsRequestProviderData):
     """
     Adapter to use CentML's serverless inference endpoints,
-    which adhere to the OpenAI API spec, inside llama-stack.
+    which adhere to the OpenAI chat/completions API spec,
+    inside llama-stack.
     """
 
     def __init__(self, config: CentMLImplConfig) -> None:
-        ModelRegistryHelper.__init__(self, MODEL_ALIASES)
+        super().__init__(MODEL_ALIASES)
         self.config = config
         self.formatter = ChatFormat(Tokenizer.get_instance())
 
@@ -116,6 +117,9 @@ class CentMLInferenceAdapter(ModelRegistryHelper, Inference,
         stream: Optional[bool] = False,
         logprobs: Optional[LogProbConfig] = None,
     ) -> AsyncGenerator:
+        """
+        For "completion" style requests (non-chat).
+        """
         model = await self.model_store.get_model(model_id)
         request = CompletionRequest(
             model=model.provider_resource_id,
@@ -133,16 +137,17 @@ class CentMLInferenceAdapter(ModelRegistryHelper, Inference,
     async def _nonstream_completion(
             self, request: CompletionRequest) -> ChatCompletionResponse:
         params = await self._get_params(request)
-        r = self._get_client().completions.create(**params)
-        return process_completion_response(r, self.formatter)
+        # Using the older "completions" route for non-chat
+        response = self._get_client().completions.create(**params)
+        return process_completion_response(response, self.formatter)
 
     async def _stream_completion(self,
                                  request: CompletionRequest) -> AsyncGenerator:
         params = await self._get_params(request)
 
         async def _to_async_generator():
-            s = self._get_client().completions.create(**params)
-            for chunk in s:
+            stream = self._get_client().completions.create(**params)
+            for chunk in stream:
                 yield chunk
 
         stream = _to_async_generator()
@@ -166,6 +171,9 @@ class CentMLInferenceAdapter(ModelRegistryHelper, Inference,
         stream: Optional[bool] = False,
         logprobs: Optional[LogProbConfig] = None,
     ) -> AsyncGenerator:
+        """
+        For "chat completion" style requests.
+        """
         model = await self.model_store.get_model(model_id)
         request = ChatCompletionRequest(
             model=model.provider_resource_id,
@@ -186,12 +194,15 @@ class CentMLInferenceAdapter(ModelRegistryHelper, Inference,
     async def _nonstream_chat_completion(
             self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         params = await self._get_params(request)
-        # If we have messages, use chat; else use completions
+
+        # For chat requests, if "messages" is in params -> .chat.completions
         if "messages" in params:
-            r = self._get_client().chat.completions.create(**params)
+            response = self._get_client().chat.completions.create(**params)
         else:
-            r = self._get_client().completions.create(**params)
-        return process_chat_completion_response(r, self.formatter)
+            # fallback if we ended up only with "prompt"
+            response = self._get_client().completions.create(**params)
+
+        return process_chat_completion_response(response, self.formatter)
 
     async def _stream_chat_completion(
             self, request: ChatCompletionRequest) -> AsyncGenerator:
@@ -199,10 +210,10 @@ class CentMLInferenceAdapter(ModelRegistryHelper, Inference,
 
         async def _to_async_generator():
             if "messages" in params:
-                s = self._get_client().chat.completions.create(**params)
+                stream = self._get_client().chat.completions.create(**params)
             else:
-                s = self._get_client().completions.create(**params)
-            for chunk in s:
+                stream = self._get_client().completions.create(**params)
+            for chunk in stream:
                 yield chunk
 
         stream = _to_async_generator()
@@ -216,25 +227,25 @@ class CentMLInferenceAdapter(ModelRegistryHelper, Inference,
 
     async def _get_params(
             self, request: Union[ChatCompletionRequest,
-                                CompletionRequest]) -> dict:
+                                 CompletionRequest]) -> dict:
+        """
+        Build the 'params' dict that the OpenAI (CentML) client expects.
+        For chat requests, we always prefer "messages" so that it calls
+        the chat endpoint properly.
+        """
         input_dict = {}
         media_present = request_has_media(request)
 
         if isinstance(request, ChatCompletionRequest):
-            if media_present:
-                # Convert each message individually
-                input_dict["messages"] = [
-                    await convert_message_to_openai_dict(m)
-                    for m in request.messages
-                ]
-            else:
-                # Convert entire conversation to one prompt
-                input_dict["prompt"] = await chat_completion_request_to_prompt(
-                    request, self.get_llama_model(request.model),
-                    self.formatter)
+            # For chat requests, always build "messages" from the user messages
+            input_dict["messages"] = [
+                await convert_message_to_openai_dict(m)
+                for m in request.messages
+            ]
+
         else:
-            # No media support for simple Completions
-            assert not media_present, "CentML does not support media for Completion requests"
+            # Non-chat (CompletionRequest)
+            assert not media_present, "CentML does not support media for completions"
             input_dict["prompt"] = await completion_request_to_prompt(
                 request, self.formatter)
 
@@ -252,6 +263,9 @@ class CentMLInferenceAdapter(ModelRegistryHelper, Inference,
         sampling_params: Optional[SamplingParams],
         fmt: Optional[ResponseFormat],
     ) -> dict:
+        """
+        Build temperature, max_tokens, top_p, etc., plus any response format data.
+        """
         options = get_sampling_options(sampling_params)
         options.setdefault("max_tokens", 512)
 
