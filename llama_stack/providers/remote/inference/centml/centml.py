@@ -9,7 +9,6 @@ from typing import AsyncGenerator, List, Optional, Union
 from openai import OpenAI
 
 from llama_models.datatypes import CoreModelId
-
 from llama_models.llama3.api.chat_format import ChatFormat
 from llama_models.llama3.api.tokenizer import Tokenizer
 
@@ -18,7 +17,6 @@ from llama_stack.apis.inference import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     CompletionRequest,
-    CompletionResponse,
     EmbeddingsResponse,
     Inference,
     LogProbConfig,
@@ -53,31 +51,26 @@ from llama_stack.providers.utils.inference.prompt_adapter import (
 
 from .config import CentMLImplConfig
 
-#
 # Example model aliases that map from CentML’s
 # published model identifiers to llama-stack's `CoreModelId`.
-# Adjust or expand this list based on actual models
-# you have available via CentML.
-#
 MODEL_ALIASES = [
     build_model_alias(
-        "meta-llama/Llama-3.2-3B-Instruct-Turbo",
+        "meta-llama/Llama-3.2-3B-Instruct",
         CoreModelId.llama3_2_3b_instruct.value,
     ),
-    # Add any additional aliases as needed
+    # Add more build_model_alias() calls as needed
 ]
 
 
-class CentMLInferenceAdapter(
-    ModelRegistryHelper, Inference, NeedsRequestProviderData
-):
+class CentMLInferenceAdapter(ModelRegistryHelper, Inference,
+                            NeedsRequestProviderData):
     """
     Adapter to use CentML's serverless inference endpoints,
     which adhere to the OpenAI API spec, inside llama-stack.
     """
 
     def __init__(self, config: CentMLImplConfig) -> None:
-        super().__init__(MODEL_ALIASES)
+        ModelRegistryHelper.__init__(self, MODEL_ALIASES)
         self.config = config
         self.formatter = ChatFormat(Tokenizer.get_instance())
 
@@ -104,14 +97,14 @@ class CentMLInferenceAdapter(
 
     def _get_client(self) -> OpenAI:
         """
-        Creates an OpenAI-compatible client pointing to CentML's
-        base URL, using the user's CentML API key.
+        Creates an OpenAI-compatible client pointing to CentML's base URL,
+        using the user's CentML API key.
         """
         api_key = self._get_api_key()
-        return OpenAI(api_key=api_key, base_url="https://api.centml.com/openai/v1")
+        return OpenAI(api_key=api_key, base_url=self.config.url)
 
     #
-    # COMPLETIONS
+    # COMPLETION (non-chat)
     #
 
     async def completion(
@@ -123,10 +116,6 @@ class CentMLInferenceAdapter(
         stream: Optional[bool] = False,
         logprobs: Optional[LogProbConfig] = None,
     ) -> AsyncGenerator:
-        """
-        This method is called by llama-stack for "completion" style requests
-        (non-chat) and must return an async generator.
-        """
         model = await self.model_store.get_model(model_id)
         request = CompletionRequest(
             model=model.provider_resource_id,
@@ -142,35 +131,27 @@ class CentMLInferenceAdapter(
             return await self._nonstream_completion(request)
 
     async def _nonstream_completion(
-        self, request: CompletionRequest
-    ) -> CompletionResponse:
+            self, request: CompletionRequest) -> ChatCompletionResponse:
         params = await self._get_params(request)
-        # CentML (OpenAI-compatible) with synchronous call:
-        # Here we wrap it in an async method.
-        response = self._get_client().completions.create(**params)
-        return process_completion_response(response, self.formatter)
+        r = self._get_client().completions.create(**params)
+        return process_completion_response(r, self.formatter)
 
-    async def _stream_completion(self, request: CompletionRequest) -> AsyncGenerator:
+    async def _stream_completion(self,
+                                 request: CompletionRequest) -> AsyncGenerator:
         params = await self._get_params(request)
 
-        # For streaming, we wrap the streaming generator from
-        # CentML/OpenAI in an async generator for llama-stack.
         async def _to_async_generator():
-            # The typical openai-python library for streaming:
-            #   for chunk in openai.Completion.create(**params, stream=True):
-            #       yield chunk
-            #
-            # We replicate that pattern here:
-            stream = self._get_client().completions.create(**params)
-            for chunk in stream:
+            s = self._get_client().completions.create(**params)
+            for chunk in s:
                 yield chunk
 
         stream = _to_async_generator()
-        async for chunk in process_completion_stream_response(stream, self.formatter):
+        async for chunk in process_completion_stream_response(
+                stream, self.formatter):
             yield chunk
 
     #
-    # CHAT COMPLETIONS
+    # CHAT COMPLETION
     #
 
     async def chat_completion(
@@ -180,14 +161,11 @@ class CentMLInferenceAdapter(
         sampling_params: Optional[SamplingParams] = SamplingParams(),
         tools: Optional[List[ToolDefinition]] = None,
         tool_choice: Optional[ToolChoice] = ToolChoice.auto,
-        tool_prompt_format: Optional[ToolPromptFormat] = ToolPromptFormat.json,
+        tool_prompt_format: Optional[ToolPromptFormat] = None,
         response_format: Optional[ResponseFormat] = None,
         stream: Optional[bool] = False,
         logprobs: Optional[LogProbConfig] = None,
     ) -> AsyncGenerator:
-        """
-        This method is called by llama-stack for "chat completion" style requests.
-        """
         model = await self.model_store.get_model(model_id)
         request = ChatCompletionRequest(
             model=model.provider_resource_id,
@@ -200,58 +178,81 @@ class CentMLInferenceAdapter(
             stream=stream,
             logprobs=logprobs,
         )
-
         if stream:
             return self._stream_chat_completion(request)
         else:
             return await self._nonstream_chat_completion(request)
 
     async def _nonstream_chat_completion(
-        self, request: ChatCompletionRequest
-    ) -> ChatCompletionResponse:
+            self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         params = await self._get_params(request)
+        # If we have messages, use chat; else use completions
         if "messages" in params:
-            response = self._get_client().chat.completions.create(**params)
+            r = self._get_client().chat.completions.create(**params)
         else:
-            response = self._get_client().completions.create(**params)
-
-        return process_chat_completion_response(response, self.formatter)
+            r = self._get_client().completions.create(**params)
+        return process_chat_completion_response(r, self.formatter)
 
     async def _stream_chat_completion(
-        self, request: ChatCompletionRequest
-    ) -> AsyncGenerator:
+            self, request: ChatCompletionRequest) -> AsyncGenerator:
         params = await self._get_params(request)
 
         async def _to_async_generator():
             if "messages" in params:
-                stream = self._get_client().chat.completions.create(**params)
+                s = self._get_client().chat.completions.create(**params)
             else:
-                stream = self._get_client().completions.create(**params)
-
-            for chunk in stream:
+                s = self._get_client().completions.create(**params)
+            for chunk in s:
                 yield chunk
 
         stream = _to_async_generator()
         async for chunk in process_chat_completion_stream_response(
-            stream, self.formatter
-        ):
+                stream, self.formatter):
             yield chunk
 
     #
     # HELPER METHODS
     #
 
+    async def _get_params(
+            self, request: Union[ChatCompletionRequest,
+                                CompletionRequest]) -> dict:
+        input_dict = {}
+        media_present = request_has_media(request)
+
+        if isinstance(request, ChatCompletionRequest):
+            if media_present:
+                # Convert each message individually
+                input_dict["messages"] = [
+                    await convert_message_to_openai_dict(m)
+                    for m in request.messages
+                ]
+            else:
+                # Convert entire conversation to one prompt
+                input_dict["prompt"] = await chat_completion_request_to_prompt(
+                    request, self.get_llama_model(request.model),
+                    self.formatter)
+        else:
+            # No media support for simple Completions
+            assert not media_present, "CentML does not support media for Completion requests"
+            input_dict["prompt"] = await completion_request_to_prompt(
+                request, self.formatter)
+
+        return {
+            "model":
+            request.model,
+            **input_dict,
+            "stream":
+            request.stream,
+            **self._build_options(request.sampling_params, request.response_format),
+        }
+
     def _build_options(
         self,
         sampling_params: Optional[SamplingParams],
         fmt: Optional[ResponseFormat],
     ) -> dict:
-        """
-        Build the request parameters (temperature, max_tokens, etc.)
-        matching the standard OpenAI-based arguments.
-        """
         options = get_sampling_options(sampling_params)
-        # Provide defaults that might suit your environment
         options.setdefault("max_tokens", 512)
 
         if fmt:
@@ -261,53 +262,12 @@ class CentMLInferenceAdapter(
                     "schema": fmt.json_schema,
                 }
             elif fmt.type == ResponseFormatType.grammar.value:
-                # Example BNF-based grammar
-                options["response_format"] = {
-                    "type": "grammar",
-                    "grammar": fmt.bnf,
-                }
+                raise NotImplementedError(
+                    "Grammar response format not supported yet")
             else:
                 raise ValueError(f"Unknown response format {fmt.type}")
 
         return options
-
-    async def _get_params(
-        self, request: Union[ChatCompletionRequest, CompletionRequest]
-    ) -> dict:
-        """
-        Converts the llama-stack request object into the parameters
-        needed by an OpenAI/CentML call.
-        """
-        input_dict = {}
-        media_present = request_has_media(request)
-
-        if isinstance(request, ChatCompletionRequest):
-            # If there's media, we convert the individual messages
-            if media_present:
-                input_dict["messages"] = [
-                    await convert_message_to_openai_dict(m) for m in request.messages
-                ]
-            else:
-                # Otherwise, we convert the entire conversation into a single prompt
-                input_dict["prompt"] = await chat_completion_request_to_prompt(
-                    request, self.get_llama_model(request.model), self.formatter
-                )
-        else:
-            # CentML currently does not support media in completions
-            assert (
-                not media_present
-            ), "CentML does not support media for Completion requests"
-            input_dict["prompt"] = await completion_request_to_prompt(
-                request, self.formatter
-            )
-
-        # Combine with sampling/response format
-        return {
-            "model": request.model,
-            **input_dict,
-            "stream": request.stream,
-            **self._build_options(request.sampling_params, request.response_format),
-        }
 
     #
     # EMBEDDINGS
@@ -318,20 +278,14 @@ class CentMLInferenceAdapter(
         model_id: str,
         contents: List[InterleavedContent],
     ) -> EmbeddingsResponse:
-        """
-        Create embeddings for the requested content using CentML
-        (OpenAI-compatible) embeddings endpoint.
-        """
         model = await self.model_store.get_model(model_id)
-        assert all(
-            not content_has_media(content) for content in contents
-        ), "CentML does not support media for embeddings"
+        # CentML does not support media
+        assert all(not content_has_media(c) for c in contents), \
+            "CentML does not support media for embeddings"
 
-        response = self._get_client().embeddings.create(
+        resp = self._get_client().embeddings.create(
             model=model.provider_resource_id,
-            input=[interleaved_content_as_str(content) for content in contents],
+            input=[interleaved_content_as_str(c) for c in contents],
         )
-
-        # The openai-compatible embeddings response has a .data list
-        embeddings = [item.embedding for item in response.data]
+        embeddings = [item.embedding for item in resp.data]
         return EmbeddingsResponse(embeddings=embeddings)
