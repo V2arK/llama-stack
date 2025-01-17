@@ -62,7 +62,6 @@ MODEL_ALIASES = [
         "meta-llama/Llama-3.1-405B-Instruct-FP8",
         CoreModelId.llama3_1_405b_instruct.value,
     ),
-    # Add more build_model_alias() calls as needed
 ]
 
 
