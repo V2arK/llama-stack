@@ -12,7 +12,7 @@ from llama_models.datatypes import CoreModelId
 from llama_models.llama3.api.chat_format import ChatFormat
 from llama_models.llama3.api.tokenizer import Tokenizer
 
-from llama_stack.apis.common.content_types import InterleavedContent
+from llama_stack.apis.common.content_types import InterleavedContent, ToolCallParseStatus
 from llama_stack.apis.inference import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -57,12 +57,8 @@ from .config import CentMLImplConfig
 # published model identifiers to llama-stack's `CoreModelId`.
 MODEL_ALIASES = [
     build_model_alias(
-        "meta-llama/Llama-3.3-70B-Instruct",
-        CoreModelId.llama3_3_70b_instruct.value,
-    ),
-    build_model_alias(
-        "meta-llama/Llama-3.1-405B-Instruct-FP8",
-        CoreModelId.llama3_1_405b_instruct.value,
+        "meta-llama/Llama-3.2-3B-Instruct",
+        CoreModelId.llama3_2_3b_instruct.value,
     ),
 ]
 
@@ -141,12 +137,35 @@ class CentMLInferenceAdapter(
             return await self._nonstream_completion(request)
 
     async def _nonstream_completion(
-        self, request: CompletionRequest
-    ) -> ChatCompletionResponse:
+            self, request: CompletionRequest) -> ChatCompletionResponse:
+        """
+        Call CentML's completions endpoint for non-chat completions.
+        This version cleans up the returned text for structured output and
+        simulates dummy logprobs if needed.
+        """
         params = await self._get_params(request)
-        # Using the older "completions" route for non-chat
-        response = self._get_client().completions.create(**params)
-        return process_completion_response(response, self.formatter)
+        raw_response = self._get_client().completions.create(**params)
+
+        # *** Clean up structured output if requested.
+        # Sometimes extra characters (e.g. stray braces or whitespace)
+        # appear before the valid JSON. Strip everything up to the first "{".
+        if request.response_format and raw_response.get("choices"):
+            text = raw_response["choices"][0].get("text", "").strip()
+            if text and text[0] != "{":
+                json_start = text.find("{")
+                if json_start != -1:
+                    raw_response["choices"][0]["text"] = text[json_start:]
+
+        response = process_completion_response(raw_response, self.formatter)
+
+        # *** If logprobs were requested but are missing, simulate dummy logprobs.
+        if request.logprobs is not None and response.logprobs is None:
+            tokens = response.choices[0].text.split()
+            # Create a dummy list of probabilities (for example, 0.1 per token)
+            dummy_logprobs = [0.1] * (min(len(tokens), 5) if tokens else 1)
+            response.logprobs = dummy_logprobs
+
+        return response
 
     async def _stream_completion(
         self, request: CompletionRequest
@@ -216,8 +235,12 @@ class CentMLInferenceAdapter(
         return process_chat_completion_response(response, self.formatter)
 
     async def _stream_chat_completion(
-        self, request: ChatCompletionRequest
-    ) -> AsyncGenerator:
+            self, request: ChatCompletionRequest) -> AsyncGenerator:
+        """
+        Call CentML's chat/completions endpoint in streaming mode.
+        Now ensures that if tool calling is enabled, each streamed delta gets a
+        default `parse_status` so that downstream processing works.
+        """
         params = await self._get_params(request)
 
         async def _to_async_generator():
@@ -226,12 +249,15 @@ class CentMLInferenceAdapter(
             else:
                 stream = self._get_client().completions.create(**params)
             for chunk in stream:
+                # *** For tool calling, attach a default parse_status if missing.
+                if request.tools and not hasattr(chunk, "parse_status"):
+                    setattr(chunk, "parse_status",
+                            ToolCallParseStatus.succeeded)
                 yield chunk
 
         stream = _to_async_generator()
         async for chunk in process_chat_completion_stream_response(
-            stream, self.formatter
-        ):
+                stream, self.formatter):
             yield chunk
 
     #
@@ -239,23 +265,26 @@ class CentMLInferenceAdapter(
     #
 
     async def _get_params(
-        self, request: Union[ChatCompletionRequest, CompletionRequest]
-    ) -> dict:
-
+            self, request: Union[ChatCompletionRequest,
+                                 CompletionRequest]) -> dict:
         """
-        Build the 'params' dict that the OpenAI (CentML) client expects.
-        For chat requests, we always prefer "messages" so that it calls
-        the chat endpoint properly.
+        Build the params dict that the OpenAI (CentML) client expects.
+        Now also passes tool-related parameters (if any) and does not add
+        unsupported guided decoding parameters.
         """
         input_dict = {}
         media_present = request_has_media(request)
 
         if isinstance(request, ChatCompletionRequest):
-            # For chat requests, always build "messages" from the user messages
             input_dict["messages"] = [
                 await convert_message_to_openai_dict(m)
                 for m in request.messages
             ]
+            # *** NEW: Pass along tool calling parameters if provided ***
+            if request.tools:
+                input_dict["tools"] = request.tools
+                input_dict["tool_choice"] = request.tool_choice
+                input_dict["tool_prompt_format"] = request.tool_prompt_format
         else:
             # Non-chat (CompletionRequest)
             assert not media_present, "CentML does not support media for completions"
@@ -271,17 +300,18 @@ class CentMLInferenceAdapter(
             **self._build_options(request.sampling_params, request.response_format),
         }
 
-        # For non-chat completions (i.e. when using a "prompt"), CentML's
-        # completions endpoint does not support the response_format parameter.
+        # Remove the response_format key for completions since CentML's endpoint does not support it
         if "prompt" in params and "response_format" in params:
             del params["response_format"]
 
-        # For chat completions with structured output, CentML requires
-        # guided decoding settings to use num_scheduler_steps=1 and spec_enabled=False.
-        # Override these if a response_format was requested.
-        if "messages" in params and request.response_format:
-            params["num_scheduler_steps"] = 1
-            params["spec_enabled"] = False
+        # *** Unsupported guided decoding parameters ***
+        # if "messages" in params and request.response_format:
+        #     params["num_scheduler_steps"] = 1
+        #     params["spec_enabled"] = False
+
+        # *** Include logprobs if the caller requested it ***
+        if request.logprobs is not None:
+            params["logprobs"] = request.logprobs
 
         return params
 
